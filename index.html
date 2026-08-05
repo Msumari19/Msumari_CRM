@@ -441,16 +441,20 @@ textarea{resize:vertical;min-height:70px}
         <div></div>
       </div>
 
-      <div class="form-section-title">Service type</div>
+      <div class="form-section-title">Business Type &amp; Service</div>
+      <div class="form-row">
+        <div><label>Business Type</label><select id="f-custtype" onchange="onBizTypeChange()"></select><div class="settings-hint" id="biz-objective-hint" style="margin-top:4px"></div></div>
+        <div></div>
+      </div>
       <div class="form-full">
         <div class="svc-pills" id="svc-pills"></div>
         <input type="hidden" id="f-svc">
       </div>
 
-      <div class="form-section-title post-lead-only">Business & pipeline</div>
+      <div class="form-section-title post-lead-only">Pipeline</div>
       <div class="form-row post-lead-only">
-        <div><label>Business Type</label><select id="f-custtype" onchange="onBizTypeChange()"></select><div class="settings-hint" id="biz-objective-hint" style="margin-top:4px"></div></div>
         <div id="progress-stage-wrap" style="display:none"><label>Progress stage</label><select id="f-stage"></select></div>
+        <div></div>
       </div>
       <div class="form-row post-lead-only">
         <div><label>Price sensitivity (1 low – 5 high)</label>
@@ -2859,7 +2863,7 @@ function previewBranding(){
 }
 function saveBranding(){
   BRANDING = {
-    companyName: document.getElementById('brand-name-input').value.trim() || 'Baridi Baridi',
+    companyName: document.getElementById('brand-name-input').value.trim() || 'Msumari BizFlow',
     primary: document.getElementById('brand-primary-input').value,
     accent: document.getElementById('brand-accent-input').value,
     logo: pendingLogo !== undefined ? pendingLogo : BRANDING.logo
