@@ -449,7 +449,7 @@ textarea{resize:vertical;min-height:70px}
 
       <div class="form-section-title post-lead-only">Business & pipeline</div>
       <div class="form-row post-lead-only">
-        <div><label>Business Type</label><input id="f-custtype" placeholder="e.g. B2B, Retail, Clinic, Residential"></div>
+        <div><label>Business Type</label><select id="f-custtype" onchange="onBizTypeChange()"></select><div class="settings-hint" id="biz-objective-hint" style="margin-top:4px"></div></div>
         <div id="progress-stage-wrap" style="display:none"><label>Progress stage</label><select id="f-stage"></select></div>
       </div>
       <div class="form-row post-lead-only">
@@ -598,7 +598,26 @@ textarea{resize:vertical;min-height:70px}
 <script>
 let STAGES = ['Leads','Site check request','Site check finished','Contract Signed','Work Reschedule','Work Scheduled','Delivery Completed','Installation','Completed','Active Customer','Churned','Lost order'];
 const STAGE_COLORS = {'Leads':'b-gray','Site check request':'b-blue','Site check finished':'b-blue','Contract Signed':'b-purple','Work Reschedule':'b-orange','Work Scheduled':'b-orange','Delivery Completed':'b-green','Installation':'b-green','Completed':'b-green','Active Customer':'b-green','Churned':'b-red','Lost order':'b-red'};
-let SERVICES = ['Instalment','Oneshot','Subscription','Office/residential','Corporate'];
+/* ---------- BUSINESS TYPE / SERVICE / STAGE CASCADE ----------
+   Three admin-configurable levels, same nested-editor pattern as Regions -> Districts:
+     Business Type  (who the customer is, e.g. "Residential", "Corporate")
+       -> Services   (what's sold to that kind of customer)
+            -> Progress stages (that Service's pipeline, after Lead -> Contact)
+   `objective` is a free-text note describing what that Business Type is FOR — shown to
+   your team in Settings and on the record, not a filter. A Service only needs an entry
+   in SERVICE_STAGES if its pipeline genuinely differs from the shared default STAGES
+   above; most services need zero extra setup and just inherit the default. */
+let BUSINESS_TYPES = {
+  'Residential': { objective: 'New household acquisition & instalment collection', services: ['Instalment','Oneshot'] },
+  'Corporate':   { objective: 'B2B contracts and recurring billing', services: ['Subscription','Corporate'] },
+  'Office':      { objective: 'Recurring service contracts for offices', services: ['Office/residential'] }
+};
+let SERVICE_STAGES = {}; // optional per-service override, e.g. {'Subscription':['Onboarding call','Trial period','Active Member','Lapsed']}
+function allServices(){ return [...new Set(Object.values(BUSINESS_TYPES).flatMap(bt => bt.services || []))]; }
+function servicesForBizType(bt){ return (BUSINESS_TYPES[bt] && BUSINESS_TYPES[bt].services) || []; }
+function stagesForService(svc){ const custom = svc && SERVICE_STAGES[svc]; return (custom && custom.length) ? custom : STAGES.slice(1); }
+function fullStagesForService(svc){ return ['Leads', ...stagesForService(svc)]; }
+function allStagesUnion(){ return ['Leads', ...new Set([...STAGES.slice(1), ...Object.values(SERVICE_STAGES).flat()])]; }
 /* Prospect priority for Leads only. Not a user-editable list (fixed 3-value scale) —
    Medium/High is a soft signal to convert the Lead to a Contact; no other part of the
    record depends on it. */
@@ -622,13 +641,14 @@ let AREA_SUGGESTIONS = ['Mwenge','Mikocheni','Masaki','Sinza','Kariakoo','Upanga
 let LEAD_SOURCES = ['WhatsApp','Phone Call','Referral','Walk-in','Facebook','Instagram','Website','Field Agent'];
 const NEW_OR_REPLACEMENT = ['New','Replacement'];
 /* ---------- PIPELINE MODEL ----------
-   Every record is a Lead first (c.stage === 'Leads', fixed, never user-removable —
-   see STAGES[0] below). Converting a Lead makes it a Contact, and the very same action
-   assigns it the first Progress stage — a Contact can never exist without a Progress
-   stage. STAGES[1..] are the Progress stages: product/service-based, fully editable in
-   Settings (add/remove), freely reorderable among themselves. Moving forward only
-   happens one deliberate step at a time: Lead -> Contact+Progress via convertLead(),
-   never a direct jump into an arbitrary Progress stage, and never back to Leads. */
+   Every record is a Lead first (c.stage === 'Leads', fixed, never user-removable).
+   Converting a Lead makes it a Contact, and the very same action assigns it the first
+   Progress stage for its Service — a Contact can never exist without a Progress stage.
+   Progress stages come from stagesForService(c.svc): a per-service override in
+   SERVICE_STAGES if one has been set up, otherwise the shared default STAGES[1..], both
+   fully editable in Settings. Moving forward only happens one deliberate step at a time:
+   Lead -> Contact+Progress via convertLead(), never a direct jump into an arbitrary
+   Progress stage, and never back to Leads. */
 const STORE_KEY = 'bb_crm_customers';
 const CONFIG_KEY = 'bb_crm_config';
 const TERMINAL_GOOD = 'Active Customer';
@@ -935,7 +955,8 @@ async function loadData(){
     try{
       const cfg = JSON.parse(rawCfg);
       if(cfg.stages && cfg.stages.length) STAGES = cfg.stages;
-      if(cfg.services && cfg.services.length) SERVICES = cfg.services;
+      if(cfg.businessTypes && Object.keys(cfg.businessTypes).length) BUSINESS_TYPES = cfg.businessTypes;
+      if(cfg.serviceStages && typeof cfg.serviceStages === 'object') SERVICE_STAGES = cfg.serviceStages;
       if(cfg.flags && Object.keys(cfg.flags).length) FLAG_LABELS = cfg.flags;
       if(Array.isArray(cfg.customFields)) CUSTOM_FIELDS = cfg.customFields;
       if(cfg.branding) BRANDING = { ...BRANDING, ...cfg.branding };
@@ -954,7 +975,7 @@ async function loadData(){
 async function persistConfig(){
   updateSyncBadge('saving');
   await storageSet(CONFIG_KEY, JSON.stringify({
-    stages:STAGES, services:SERVICES, flags:FLAG_LABELS, customFields:CUSTOM_FIELDS, branding:BRANDING,
+    stages:STAGES, businessTypes:BUSINESS_TYPES, serviceStages:SERVICE_STAGES, flags:FLAG_LABELS, customFields:CUSTOM_FIELDS, branding:BRANDING,
     regions:REGIONS, areaSuggestions:AREA_SUGGESTIONS, leadSources:LEAD_SOURCES
   }));
   updateSyncBadge();
@@ -1000,12 +1021,22 @@ function showToast(msg){
 }
 
 /* ---------- INIT ---------- */
-function buildFormOptions(){
+function populateStageOptions(svc){
   const stageSel = document.getElementById('f-stage');
   const prevStage = stageSel.value;
+  const opts = stagesForService(svc);
   stageSel.innerHTML = '';
-  STAGES.slice(1).forEach(s => stageSel.add(new Option(s,s))); // Progress stages only — Leads isn't a pickable option
-  if(STAGES.includes(prevStage)) stageSel.value = prevStage;
+  opts.forEach(s => stageSel.add(new Option(s,s)));
+  if(opts.includes(prevStage)) stageSel.value = prevStage;
+}
+function buildFormOptions(){
+  populateStageOptions(document.getElementById('f-svc').value);
+
+  const bizSel = document.getElementById('f-custtype');
+  const prevBiz = bizSel.value;
+  bizSel.innerHTML = '<option value="">Select business type...</option>' + Object.keys(BUSINESS_TYPES).map(bt => `<option value="${bt}">${bt}</option>`).join('');
+  if(BUSINESS_TYPES[prevBiz]) bizSel.value = prevBiz;
+  updateBizObjectiveHint(bizSel.value);
 
   const prospectSel = document.getElementById('f-prospect');
   prospectSel.innerHTML = PROSPECT_LEVELS.map(v => `<option${v==='Low'?' selected':''}>${v}</option>`).join('');
@@ -1014,7 +1045,7 @@ function buildFormOptions(){
   document.getElementById('f-income').innerHTML = INCOME_BRACKETS.map(v => `<option>${v}</option>`).join('');
   document.getElementById('f-risk').innerHTML = RISK_PROFILES.map(v => `<option>${v}</option>`).join('');
 
-  document.getElementById('svc-pills').innerHTML = SERVICES.map(s =>
+  document.getElementById('svc-pills').innerHTML = allServices().map(s =>
     `<div class="svc-pill" onclick="selectSvc(this,'${s}')">${s}</div>`).join('');
 
   document.getElementById('flag-box').innerHTML = Object.entries(FLAG_LABELS).map(([k,v]) =>
@@ -1052,6 +1083,29 @@ function onRegionChange(){
   }
   districtSel.disabled = false;
   districtSel.innerHTML = '<option value="">Select district...</option>' + REGIONS[region].map(d => `<option>${d}</option>`).join('');
+}
+function updateBizObjectiveHint(bt){
+  const hint = document.getElementById('biz-objective-hint');
+  if(!hint) return;
+  hint.textContent = (bt && BUSINESS_TYPES[bt] && BUSINESS_TYPES[bt].objective) ? BUSINESS_TYPES[bt].objective : '';
+}
+/* Business Type -> Service cascade, same idea as Region -> District: picking a Business
+   Type narrows the Service pills to just what that type of customer is offered. Leaving
+   it unset (e.g. on a brand-new Lead, before a Business Type has been decided) shows every
+   configured Service across all Business Types. */
+function onBizTypeChange(){
+  const bt = document.getElementById('f-custtype').value;
+  updateBizObjectiveHint(bt);
+  const prevSvc = document.getElementById('f-svc').value;
+  const list = bt ? servicesForBizType(bt) : allServices();
+  document.getElementById('svc-pills').innerHTML = list.map(s =>
+    `<div class="svc-pill" onclick="selectSvc(this,'${s}')">${s}</div>`).join('');
+  const keepSvc = list.includes(prevSvc) ? prevSvc : '';
+  document.getElementById('f-svc').value = keepSvc;
+  document.querySelectorAll('.svc-pill').forEach(p => p.classList.toggle('active', p.textContent === keepSvc));
+  if(document.getElementById('progress-stage-wrap').style.display !== 'none'){
+    populateStageOptions(keepSvc);
+  }
 }
 /* ---------- AUTH ---------- */
 async function handleSignIn(){
@@ -1415,6 +1469,11 @@ function selectSvc(el, val){
   document.querySelectorAll('.svc-pill').forEach(p => p.classList.remove('active'));
   if(el){ el.classList.add('active'); }
   document.getElementById('f-svc').value = val || '';
+  // Stages are Service-specific, so refresh the Progress-stage options whenever the
+  // Service changes on a record where that picker is showing.
+  if(document.getElementById('progress-stage-wrap').style.display !== 'none'){
+    populateStageOptions(val || '');
+  }
 }
 
 /* ---------- NAV ---------- */
@@ -1501,7 +1560,7 @@ function confirmConvertLead(){
 function finalizeConvertLead(id){
   const c = customers.find(x=>x.id===id);
   if(c){
-    c.stage = STAGES[1] || 'Site check request';
+    c.stage = stagesForService(c.svc)[0] || 'Site check request';
     if(!Array.isArray(c.journey)) c.journey = [];
     ensureOwner(c);
     c.journey.push({stage:c.stage, date:new Date().toISOString(), action:'Lead converted', ...stampBy()});
@@ -1544,6 +1603,12 @@ function openModal(id = null){
     document.getElementById('f-last').value = c.lastName || '';
     document.getElementById('f-phone').value = c.phone || '';
     document.getElementById('f-custtype').value = c.custtype || '';
+    updateBizObjectiveHint(c.custtype || '');
+    {
+      const svcList = c.custtype ? servicesForBizType(c.custtype) : allServices();
+      document.getElementById('svc-pills').innerHTML = svcList.map(s =>
+        `<div class="svc-pill" onclick="selectSvc(this,'${s}')">${s}</div>`).join('');
+    }
     document.getElementById('f-svc').value = c.svc || '';
     document.getElementById('f-prospect').value = c.prospectLevel || 'Low';
     const progWrap = document.getElementById('progress-stage-wrap');
@@ -1551,7 +1616,8 @@ function openModal(id = null){
       progWrap.style.display = 'none';
     } else {
       progWrap.style.display = '';
-      document.getElementById('f-stage').value = c.stage || STAGES[1] || '';
+      populateStageOptions(c.svc);
+      document.getElementById('f-stage').value = c.stage || stagesForService(c.svc)[0] || '';
     }
     document.getElementById('f-price').value = c.price || '4';
     document.getElementById('f-notes').value = c.notes || '';
@@ -1607,6 +1673,10 @@ function openModal(id = null){
     document.getElementById('save-btn-label').textContent = 'Save lead';
     flagsWrap.style.display = 'none';
     document.getElementById('progress-stage-wrap').style.display = 'none';
+    document.getElementById('f-custtype').value = '';
+    updateBizObjectiveHint('');
+    document.getElementById('svc-pills').innerHTML = allServices().map(s =>
+      `<div class="svc-pill" onclick="selectSvc(this,'${s}')">${s}</div>`).join('');
     ownerSel.innerHTML = ownerOptionsHtml(myId());
     ownerWrap.style.display = isAdmin() ? 'grid' : 'none';
     ownerTitle.style.display = isAdmin() ? 'block' : 'none';
@@ -1632,6 +1702,10 @@ function clearForm(){
   document.getElementById('progress-stage-wrap').style.display = 'none';
   document.getElementById('f-price').value = '4';
   document.getElementById('f-svc').value = '';
+  document.getElementById('f-custtype').value = '';
+  updateBizObjectiveHint('');
+  document.getElementById('svc-pills').innerHTML = allServices().map(s =>
+    `<div class="svc-pill" onclick="selectSvc(this,'${s}')">${s}</div>`).join('');
   document.getElementById('f-region').value = '';
   onRegionChange();
   ['f-source','f-newrepl'].forEach(id => document.getElementById(id).value = '');
@@ -1829,12 +1903,13 @@ function openRecord(id){
     <div class="slideover-body">
       <div class="prop-row"><span class="k">Stage</span><span class="v">${isLead
         ? `<span class="badge b-gray">Leads</span>`
-        : `<select class="stage-select" onchange="updateStage(${c.id},this.value)">${STAGES.slice(1).map(s=>`<option${s===c.stage?' selected':''}>${s}</option>`).join('')}</select>`}</span></div>
+        : `<select class="stage-select" onchange="updateStage(${c.id},this.value)">${stagesForService(c.svc).map(s=>`<option${s===c.stage?' selected':''}>${s}</option>`).join('')}</select>`}</span></div>
       <div class="prop-row"><span class="k">Owner</span><span class="v">${canReassign(c)
         ? `<select class="stage-select" onchange="assignOwner(${c.id}, this.value)">${ownerOptionsHtml(c.ownerId || null)}</select>`
         : ownerChip(c,'sm')}</span></div>
       ${c.prospectLevel ? `<div class="prop-row"><span class="k">Prospect level</span><span class="v"><span class="risk-badge risk-${c.prospectLevel.toLowerCase()}">${c.prospectLevel}</span></span></div>` : ''}
       <div class="prop-row"><span class="k">Business Type</span><span class="v">${formatBiz(c.custtype)}</span></div>
+      ${c.custtype && BUSINESS_TYPES[c.custtype] && BUSINESS_TYPES[c.custtype].objective ? `<div class="prop-row"><span class="k">Objective</span><span class="v" style="font-weight:400">${BUSINESS_TYPES[c.custtype].objective}</span></div>` : ''}
       <div class="prop-row"><span class="k">Service</span><span class="v">${c.svc||'—'}</span></div>
       <div class="prop-row"><span class="k">Price sensitivity</span><span class="v">${c.price}/5</span></div>
       ${c.leadSource ? `<div class="prop-row"><span class="k">Lead source</span><span class="v">${c.leadSource}</span></div>` : ''}
@@ -1971,8 +2046,8 @@ function renderContacts(searchOverride){
     el.innerHTML = `
       <div class="view-head"><div><h2>Contacts</h2><div class="view-sub">Every customer record in one list</div></div></div>
       <div class="filter-row">
-        <select id="contact-filter-svc" onchange="renderContacts()"><option value="">All services</option>${SERVICES.map(s=>`<option>${s}</option>`).join('')}</select>
-        <select id="contact-filter-stage" onchange="renderContacts()"><option value="">All stages</option>${STAGES.map(s=>`<option>${s}</option>`).join('')}</select>
+        <select id="contact-filter-svc" onchange="renderContacts()"><option value="">All services</option>${allServices().map(s=>`<option>${s}</option>`).join('')}</select>
+        <select id="contact-filter-stage" onchange="renderContacts()"><option value="">All stages</option>${allStagesUnion().map(s=>`<option>${s}</option>`).join('')}</select>
         <select id="contact-filter-owner" onchange="renderContacts()"></select>
         <input id="contact-search-input" placeholder="Search name, phone, or business type..." oninput="renderContacts(this.value)">
       </div>
@@ -2014,7 +2089,7 @@ function renderContacts(searchOverride){
         <div style="display:flex;align-items:center;gap:6px">
           ${c.prospectLevel && c.prospectLevel!=='Low' ? `<span class="risk-badge risk-${c.prospectLevel.toLowerCase()}">${c.prospectLevel}</span>` : ''}
           <button class="btn btn-sm btn-primary" onclick="openConvertModal(${c.id})"><i class="ti ti-arrows-exchange"></i> Convert</button>
-        </div>` : `<select class="stage-select" onchange="updateStage(${c.id},this.value)">${STAGES.slice(1).map(s=>`<option${s===c.stage?' selected':''}>${s}</option>`).join('')}</select>`}</td>
+        </div>` : `<select class="stage-select" onchange="updateStage(${c.id},this.value)">${stagesForService(c.svc).map(s=>`<option${s===c.stage?' selected':''}>${s}</option>`).join('')}</select>`}</td>
       <td>${flagsHtml(c.flags)}</td>
       <td style="color:var(--text-muted);font-size:12px">${c.date}</td>
       <td onclick="event.stopPropagation()">
@@ -2062,16 +2137,24 @@ function toggleCompanyDrill(key){
   </div>`;
 }
 
-/* ---------- DEALS BOARD ---------- */
+/* ---------- DEALS BOARD ----------
+   Progress stages are Service-specific now, so the board shows one Service's pipeline at
+   a time (Leads is a shared bucket at the front, since a Lead may not have committed to a
+   Service yet). Switching the Service selector switches which stage columns are shown. */
+let dealsBoardSvc = null;
 function renderDeals(){
   const el = document.getElementById('view-deals');
+  const services = allServices();
+  if(!dealsBoardSvc || !services.includes(dealsBoardSvc)) dealsBoardSvc = services[0] || '';
   el.innerHTML = `
-    <div class="view-head"><div><h2>Deals</h2><div class="view-sub">Drag a card to move a contact through the pipeline</div></div></div>
+    <div class="view-head"><div><h2>Deals</h2><div class="view-sub">Drag a card to move a contact through the pipeline. Leads are shared across every service; Progress columns are specific to the service selected below.</div></div></div>
+    <div class="filter-row"><select id="deals-svc-select" onchange="onDealsSvcChange(this.value)">${services.length ? services.map(s=>`<option value="${s}"${s===dealsBoardSvc?' selected':''}>${s}</option>`).join('') : '<option value="">No services configured yet</option>'}</select></div>
     <div class="board-wrap"><div class="board" id="board"></div></div>
   `;
   const board = document.getElementById('board');
-  board.innerHTML = STAGES.map(stage => {
-    const items = customers.filter(c=>c.stage===stage);
+  const stages = fullStagesForService(dealsBoardSvc);
+  board.innerHTML = stages.map(stage => {
+    const items = customers.filter(c => c.stage===stage && (stage==='Leads' || c.svc===dealsBoardSvc));
     return `<div class="board-col" data-stage="${stage}" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event,'${stage}')">
       <div class="board-col-head"><div class="board-col-title">${stage}</div><div class="board-col-count">${items.length} contact${items.length===1?'':'s'}</div></div>
       <div class="board-col-body">
@@ -2085,6 +2168,7 @@ function renderDeals(){
     </div>`;
   }).join('');
 }
+function onDealsSvcChange(v){ dealsBoardSvc = v; renderDeals(); }
 function onDragStart(e, id){ draggedId = id; e.target.classList.add('dragging'); e.dataTransfer.setData('text/plain', id); }
 function onDragEnd(e){ e.target.classList.remove('dragging'); }
 function onDragOver(e){ e.preventDefault(); e.currentTarget.classList.add('dragover'); }
@@ -2093,6 +2177,12 @@ function onDrop(e, stage){
   e.preventDefault();
   e.currentTarget.classList.remove('dragover');
   const id = draggedId || Number(e.dataTransfer.getData('text/plain'));
+  const c = customers.find(x=>x.id===id);
+  // Dropping a shared Lead card onto this board's Progress column commits it to this
+  // board's Service, so stage and service stay consistent with each other.
+  if(c && c.stage === 'Leads' && stage !== 'Leads' && c.svc !== dealsBoardSvc){
+    c.svc = dealsBoardSvc;
+  }
   updateStage(id, stage);
   draggedId = null;
 }
@@ -2213,10 +2303,10 @@ function renderReportContent(){
         <div class="stat-card"><div class="stat-label">Avg. friction flags</div><div class="stat-val">${avgFlags}</div><div class="stat-foot">Per customer record</div></div>
       </div>`;
   } else if(type === 'funnel'){
-    const max = Math.max(...STAGES.map(s => customers.filter(c=>c.stage===s).length), 1);
+    const max = Math.max(...allStagesUnion().map(s => customers.filter(c=>c.stage===s).length), 1);
     content.innerHTML = `<div class="panel panel-pad">
       <h3 style="margin-bottom:10px">Contacts by stage</h3>
-      ${STAGES.map(s => {
+      ${allStagesUnion().map(s => {
         const n = customers.filter(c=>c.stage===s).length;
         return `<div class="funnel-row"><div class="funnel-label">${s}</div><div class="funnel-bar-wrap"><div class="funnel-bar" style="width:${n/max*100}%"></div></div><div class="funnel-count">${n}</div></div>`;
       }).join('')}
@@ -2234,7 +2324,7 @@ function renderReportContent(){
       <table><thead><tr><th>Flag</th><th>Customers flagged</th><th>Conversion (flagged)</th><th>Conversion (not flagged)</th></tr></thead><tbody>${rows}</tbody></table>
     </div>`;
   } else if(type === 'service'){
-    const rows = SERVICES.map(s => {
+    const rows = allServices().map(s => {
       const group = customers.filter(c=>c.svc===s);
       if(!group.length) return '';
       const active = group.filter(c=>c.stage===TERMINAL_GOOD).length;
@@ -2273,7 +2363,7 @@ function exportReport(format){
     const total = customers.length;
     const active = customers.filter(c=>c.stage===TERMINAL_GOOD).length;
     const churned = customers.filter(c=>TERMINAL_BAD.includes(c.stage)).length;
-    const funnelRows = STAGES.map(s => `<tr><td>${s}</td><td>${customers.filter(c=>c.stage===s).length}</td></tr>`).join('');
+    const funnelRows = allStagesUnion().map(s => `<tr><td>${s}</td><td>${customers.filter(c=>c.stage===s).length}</td></tr>`).join('');
     const custRows = customers.map(c => `<tr><td>${c.name}</td><td>${c.phone||'-'}</td><td>${ownerNameOf(c)}</td><td>${c.stage}</td><td>${c.svc||'-'}</td><td>${Object.values(c.flags||{}).filter(Boolean).length}</td></tr>`).join('');
     const w = window.open('', '_blank');
     if(!w){ showToast('Please allow pop-ups to export PDF'); return; }
@@ -2409,18 +2499,23 @@ function renderSettings(){
     </div>
 
     <div class="panel panel-pad settings-section">
-      <h3><i class="ti ti-git-pull-request"></i> Pipeline stages</h3>
-      <div class="settings-hint">Every record starts as a <strong>Lead</strong>. Converting a Lead makes it a <strong>Contact</strong> — and that conversion always assigns the first Progress stage below, so a Contact is never left without one. Order matters here — it's the order stages appear in the Deals board and dropdowns. Add or remove Progress stages to match your products; the Leads stage itself is fixed and can't be removed or reordered.</div>
-      <div class="tag-list"><span class="tag-chip" style="background:var(--navy);color:#fff">Leads <span style="opacity:.7;font-weight:400;margin-left:2px">(fixed)</span></span></div>
-      <div class="settings-hint" style="margin:2px 0 8px">Progress stages (after a Lead converts to a Contact):</div>
-      <div class="tag-list" id="stage-tags"></div>
-      <div class="tag-add-row"><input id="new-stage-input" placeholder="e.g. Awaiting payment"><button class="btn btn-sm" onclick="addStage()">Add Progress stage</button></div>
+      <h3><i class="ti ti-building-store"></i> Business types &amp; services</h3>
+      <div class="settings-hint">Each Business Type groups the Services offered to that kind of customer, plus a short objective note for your team (why this Business Type exists — not shown to the customer). On the lead/contact form, picking a Business Type narrows the Service options to just this list.</div>
+      <div id="biztype-editor"></div>
+      <div class="tag-add-row"><input id="new-biztype-input" placeholder="e.g. Corporate"><button class="btn btn-sm" onclick="addBizType()">Add business type</button></div>
     </div>
 
     <div class="panel panel-pad settings-section">
-      <h3><i class="ti ti-package"></i> Service Types</h3>
-      <div class="tag-list" id="service-tags"></div>
-      <div class="tag-add-row"><input id="new-service-input" placeholder="e.g. Pay-per-use"><button class="btn btn-sm" onclick="addService()">Add service</button></div>
+      <h3><i class="ti ti-git-pull-request"></i> Pipeline stages</h3>
+      <div class="settings-hint">Every record starts as a <strong>Lead</strong>. Converting a Lead makes it a <strong>Contact</strong> — and that conversion always assigns the first Progress stage for its Service, so a Contact is never left without one. The list below is the <strong>default</strong> pipeline, used by any Service that hasn't been given its own stages. Order matters — it's the order stages appear in the Deals board and dropdowns. The Leads stage itself is fixed and can't be removed or reordered.</div>
+      <div class="tag-list"><span class="tag-chip" style="background:var(--navy);color:#fff">Leads <span style="opacity:.7;font-weight:400;margin-left:2px">(fixed)</span></span></div>
+      <div class="settings-hint" style="margin:2px 0 8px">Default Progress stages:</div>
+      <div class="tag-list" id="stage-tags"></div>
+      <div class="tag-add-row"><input id="new-stage-input" placeholder="e.g. Awaiting payment"><button class="btn btn-sm" onclick="addStage()">Add Progress stage</button></div>
+
+      <div class="settings-hint" style="margin:18px 0 8px"><strong>Custom stages per service</strong> <span class="opt">(optional — only set this up for a service whose real-world pipeline differs, e.g. Subscription vs. Instalment)</span></div>
+      <select id="stage-override-svc-select" onchange="renderStageOverrideEditor()" style="max-width:280px;margin-bottom:10px"></select>
+      <div id="stage-override-editor"></div>
     </div>
 
     <div class="panel panel-pad settings-section">
@@ -2461,8 +2556,26 @@ function renderSettings(){
   `;
   document.getElementById('stage-tags').innerHTML = STAGES.slice(1).map(s =>
     `<span class="tag-chip">${s}<button onclick="removeStage('${s.replace(/'/g,"\\'")}')" title="Remove"><i class="ti ti-x"></i></button></span>`).join('');
-  document.getElementById('service-tags').innerHTML = SERVICES.map(s =>
-    `<span class="tag-chip">${s}<button onclick="removeService('${s.replace(/'/g,"\\'")}')" title="Remove"><i class="ti ti-x"></i></button></span>`).join('');
+
+  document.getElementById('biztype-editor').innerHTML = Object.entries(BUSINESS_TYPES).map(([bt, data]) => `
+    <div class="region-block">
+      <div class="region-block-head">
+        <strong>${bt}</strong>
+        <button class="btn btn-ghost btn-sm" onclick="removeBizType('${bt.replace(/'/g,"\\'")}')" title="Remove business type"><i class="ti ti-x"></i></button>
+      </div>
+      <div style="margin:6px 0 10px">
+        <label style="margin-bottom:3px">Objective <span class="opt">(internal note, not shown to the customer)</span></label>
+        <input value="${(data.objective||'').replace(/"/g,'&quot;')}" onchange="setBizTypeObjective('${bt.replace(/'/g,"\\'")}', this.value)" placeholder="e.g. New household acquisition">
+      </div>
+      <div class="tag-list">${(data.services||[]).map(s => `<span class="tag-chip">${s}<button onclick="removeBizTypeService('${bt.replace(/'/g,"\\'")}','${s.replace(/'/g,"\\'")}')" title="Remove"><i class="ti ti-x"></i></button></span>`).join('') || '<span class="cell-sub">No services yet.</span>'}</div>
+      <div class="tag-add-row"><input id="new-service-input-${bt.replace(/[^a-zA-Z0-9]/g,'_')}" placeholder="Add service..."><button class="btn btn-sm" onclick="addBizTypeService('${bt.replace(/'/g,"\\'")}')">Add</button></div>
+    </div>`).join('') || '<div class="cell-sub">No business types yet.</div>';
+
+  const stageOverrideSel = document.getElementById('stage-override-svc-select');
+  const prevOverrideSvc = stageOverrideSel.value;
+  stageOverrideSel.innerHTML = '<option value="">Pick a service to customize...</option>' + allServices().map(s => `<option value="${s}">${s}</option>`).join('');
+  if(allServices().includes(prevOverrideSvc)) stageOverrideSel.value = prevOverrideSvc;
+  renderStageOverrideEditor();
   document.getElementById('flag-tags').innerHTML = Object.entries(FLAG_LABELS).map(([k,v]) =>
     `<span class="tag-chip">${v}<button onclick="removeFlag('${k}')" title="Remove"><i class="ti ti-x"></i></button></span>`).join('');
   document.getElementById('customfield-tags').innerHTML = CUSTOM_FIELDS.length ? CUSTOM_FIELDS.map(cf =>
@@ -2527,18 +2640,98 @@ function removeStage(val){
   STAGES = STAGES.filter(s=>s!==val);
   afterConfigChange();
 }
-function addService(){
-  const input = document.getElementById('new-service-input');
+/* ---------- BUSINESS TYPES & SERVICES (nested editor, same pattern as Regions -> Districts) ---------- */
+function addBizType(){
+  const input = document.getElementById('new-biztype-input');
   const val = input.value.trim();
   if(!val) return;
-  if(SERVICES.includes(val)){ showToast('That service already exists'); return; }
-  SERVICES.push(val);
+  if(BUSINESS_TYPES[val]){ showToast('That business type already exists'); return; }
+  BUSINESS_TYPES = { ...BUSINESS_TYPES, [val]: { objective:'', services:[] } };
   input.value = '';
   afterConfigChange();
 }
-function removeService(val){
-  SERVICES = SERVICES.filter(s=>s!==val);
+function removeBizType(bt){
+  const inUse = customers.some(c=>c.custtype===bt);
+  if(inUse && !confirm(`${customers.filter(c=>c.custtype===bt).length} contact(s) use this business type. Remove it anyway?`)) return;
+  const { [bt]: _, ...rest } = BUSINESS_TYPES;
+  BUSINESS_TYPES = rest;
   afterConfigChange();
+}
+function setBizTypeObjective(bt, val){
+  if(!BUSINESS_TYPES[bt]) return;
+  BUSINESS_TYPES = { ...BUSINESS_TYPES, [bt]: { ...BUSINESS_TYPES[bt], objective: val.trim() } };
+  afterConfigChange();
+}
+function addBizTypeService(bt){
+  const input = document.getElementById('new-service-input-' + bt.replace(/[^a-zA-Z0-9]/g,'_'));
+  const val = input.value.trim();
+  if(!val || !BUSINESS_TYPES[bt]) return;
+  if(BUSINESS_TYPES[bt].services.includes(val)){ showToast('That service already exists here'); return; }
+  BUSINESS_TYPES = { ...BUSINESS_TYPES, [bt]: { ...BUSINESS_TYPES[bt], services: [...BUSINESS_TYPES[bt].services, val] } };
+  afterConfigChange();
+}
+function removeBizTypeService(bt, svc){
+  if(!BUSINESS_TYPES[bt]) return;
+  const stillElsewhere = Object.entries(BUSINESS_TYPES).some(([k,v]) => k!==bt && (v.services||[]).includes(svc));
+  const inUse = customers.some(c=>c.svc===svc);
+  if(inUse && !stillElsewhere && !confirm(`${customers.filter(c=>c.svc===svc).length} contact(s) currently use "${svc}" and no other business type offers it. Remove it anyway?`)) return;
+  BUSINESS_TYPES = { ...BUSINESS_TYPES, [bt]: { ...BUSINESS_TYPES[bt], services: BUSINESS_TYPES[bt].services.filter(s=>s!==svc) } };
+  afterConfigChange();
+}
+
+/* ---------- PER-SERVICE STAGE OVERRIDES (optional; falls back to the default STAGES) ---------- */
+function renderStageOverrideEditor(){
+  const sel = document.getElementById('stage-override-svc-select');
+  const svc = sel ? sel.value : '';
+  const wrap = document.getElementById('stage-override-editor');
+  if(!wrap) return;
+  if(!svc){ wrap.innerHTML = ''; return; }
+  const custom = SERVICE_STAGES[svc];
+  if(!custom || !custom.length){
+    wrap.innerHTML = `<div class="settings-hint">Currently using the default stages above. <button class="btn btn-sm" onclick="startStageOverride('${svc.replace(/'/g,"\\'")}')">Customize stages for ${svc}</button></div>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="tag-list" id="stage-override-tags"></div>
+    <div class="tag-add-row"><input id="new-override-stage-input" placeholder="e.g. Trial period"><button class="btn btn-sm" onclick="addOverrideStage('${svc.replace(/'/g,"\\'")}')">Add stage</button></div>
+    <button class="btn btn-ghost btn-sm" style="margin-top:8px;color:var(--red)" onclick="resetStageOverride('${svc.replace(/'/g,"\\'")}')"><i class="ti ti-restore"></i> Reset ${svc} to default stages</button>
+  `;
+  document.getElementById('stage-override-tags').innerHTML = custom.map(s =>
+    `<span class="tag-chip">${s}<button onclick="removeOverrideStage('${svc.replace(/'/g,"\\'")}','${s.replace(/'/g,"\\'")}')" title="Remove"><i class="ti ti-x"></i></button></span>`).join('');
+}
+function startStageOverride(svc){
+  SERVICE_STAGES = { ...SERVICE_STAGES, [svc]: [...STAGES.slice(1)] }; // seed from the default so admins edit from a sane starting point
+  persistConfig();
+  renderStageOverrideEditor();
+}
+function addOverrideStage(svc){
+  const input = document.getElementById('new-override-stage-input');
+  const val = input.value.trim();
+  if(!val || !SERVICE_STAGES[svc]) return;
+  if(val.toLowerCase() === 'leads'){ showToast('"Leads" is reserved for the Lead phase'); return; }
+  if(SERVICE_STAGES[svc].includes(val)){ showToast('That stage already exists'); return; }
+  SERVICE_STAGES = { ...SERVICE_STAGES, [svc]: [...SERVICE_STAGES[svc], val] };
+  persistConfig();
+  renderStageOverrideEditor();
+  buildFormOptions();
+}
+function removeOverrideStage(svc, stage){
+  if(!SERVICE_STAGES[svc]) return;
+  if(SERVICE_STAGES[svc].length <= 1){ showToast('Keep at least one stage, or reset to default'); return; }
+  const inUse = customers.some(c=>c.svc===svc && c.stage===stage);
+  if(inUse && !confirm(`${customers.filter(c=>c.svc===svc && c.stage===stage).length} contact(s) are on this stage. Remove it anyway? They will keep this stage label until reassigned.`)) return;
+  SERVICE_STAGES = { ...SERVICE_STAGES, [svc]: SERVICE_STAGES[svc].filter(s=>s!==stage) };
+  persistConfig();
+  renderStageOverrideEditor();
+  buildFormOptions();
+}
+function resetStageOverride(svc){
+  const { [svc]: _, ...rest } = SERVICE_STAGES;
+  SERVICE_STAGES = rest;
+  persistConfig();
+  renderStageOverrideEditor();
+  buildFormOptions();
+  showToast(svc + ' reset to default stages');
 }
 function addFlag(){
   const input = document.getElementById('new-flag-input');
