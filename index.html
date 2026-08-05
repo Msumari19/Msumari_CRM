@@ -802,9 +802,125 @@ function stageColorClass(s){
   return STAGE_PALETTE[hash % STAGE_PALETTE.length];
 }
 
+/* ---------- CUSTOMERS: one row per record ----------
+   Unlike kv_store (one shared blob), each customer is its own row in the real
+   `customers` table (id text primary key, record jsonb, plus owner_id/stage/name/
+   phone/svc/segment denormalized out for RLS and filtering). Two agents editing
+   different customers now touch different rows — Postgres serializes writes
+   per-row, so there's no more "last save wins and silently clobbers someone
+   else's unrelated change" across the whole list.
+
+   The full record still lives in the `record` jsonb column with the exact same
+   shape the app has always used (including a numeric `id`, matching the existing
+   "numeric on purpose, for unquoted onclick bindings" convention), so none of the
+   many places in this file that read/write fields on a customer object needed to
+   change. Only the load/save plumbing below changed.
+
+   Two things are enforced by the database itself, not just by this code:
+   - version / updated_at / updated_by are set automatically by a BEFORE UPDATE
+     trigger (customers_touch), so we never send those ourselves on update.
+   - Hard deletes are blocked entirely by RLS (customers_delete policy is `false`
+     for everyone) — "delete" here always means a soft delete via deleted_at.
+   owner_id has a foreign key to profiles(id), so a customer can only be assigned
+   to someone who already has a profiles row (new signups get one automatically
+   via the on_auth_user_created trigger — see 002_profiles_signup_trigger.sql). */
+async function loadCustomersFromDb(){
+  try{
+    const { data, error } = await sb.from('customers')
+      .select('record')
+      .is('deleted_at', null)
+      .order('created_at', { ascending:false });
+    if(error) throw error;
+    syncMode = 'cloud';
+    return (data || []).map(row => row.record);
+  }catch(e){
+    console.error('Supabase read failed, falling back to local storage', e);
+    syncMode = 'local';
+    try{ const raw = localStorage.getItem(STORE_KEY); return raw ? JSON.parse(raw) : []; }catch(e2){ return []; }
+  }
+}
+function persistCustomersLocalFallback(){
+  // Only reached when the cloud write itself failed, so this is a single-device safety
+  // net, not a substitute for the real per-row cloud writes below.
+  try{ localStorage.setItem(STORE_KEY, JSON.stringify(customers)); }catch(e){}
+}
+// Denormalized columns kept in sync with `record` on every write, so RLS
+// (which checks owner_id/deleted_at directly on the row) and simple filtering
+// don't need to unpack jsonb. `segment` is this table's name for what the rest
+// of the app calls "Business Type" (custtype) — e.g. "B2B", "Retail", "Clinic".
+function customerRowColumns(c){
+  return {
+    owner_id: c.ownerId || null,
+    stage: c.stage || 'Leads',
+    name: c.name || null,
+    phone: c.phone || null,
+    svc: c.svc || null,
+    segment: c.custtype || null,
+  };
+}
+async function dbInsertCustomer(c){
+  try{
+    const { error } = await sb.from('customers').insert({
+      id: String(c.id),
+      record: c,
+      created_by: myId() || null,
+      ...customerRowColumns(c)
+    });
+    if(error) throw error;
+    syncMode = 'cloud'; return true;
+  }catch(e){
+    console.error('Supabase insert failed, falling back to local storage', e);
+    syncMode = 'local'; persistCustomersLocalFallback(); return false;
+  }
+}
+async function dbUpdateCustomer(c){
+  try{
+    // version/updated_at/updated_by are set by the customers_touch trigger — don't send them.
+    const { error } = await sb.from('customers')
+      .update({ record: c, ...customerRowColumns(c) })
+      .eq('id', String(c.id));
+    if(error) throw error;
+    syncMode = 'cloud'; return true;
+  }catch(e){
+    console.error('Supabase update failed, falling back to local storage', e);
+    syncMode = 'local'; persistCustomersLocalFallback(); return false;
+  }
+}
+async function dbDeleteCustomer(id){
+  // RLS blocks real DELETEs outright (customers_delete policy is `false` for
+  // everyone) — soft delete via deleted_at is the only way this can work.
+  try{
+    const { error } = await sb.from('customers')
+      .update({ deleted_at: new Date().toISOString() })
+      .eq('id', String(id));
+    if(error) throw error;
+    syncMode = 'cloud'; return true;
+  }catch(e){
+    console.error('Supabase delete failed, falling back to local storage', e);
+    syncMode = 'local'; persistCustomersLocalFallback(); return false;
+  }
+}
+async function saveNewCustomer(c){
+  updateSyncBadge('saving');
+  await dbInsertCustomer(c);
+  updateSyncBadge();
+  renderAll();
+}
+async function saveUpdatedCustomer(c){
+  updateSyncBadge('saving');
+  await dbUpdateCustomer(c);
+  updateSyncBadge();
+  renderAll();
+}
+async function saveDeletedCustomer(id){
+  updateSyncBadge('saving');
+  await dbDeleteCustomer(id);
+  updateSyncBadge();
+  renderAll();
+}
+
 async function loadData(){
-  const raw = await storageGet(STORE_KEY);
-  try{ customers = raw ? JSON.parse(raw) : []; }catch(e){ customers = []; }
+  customers = await loadCustomersFromDb();
   customers.forEach(c => {
     if(!Array.isArray(c.journey)) c.journey = [{stage:c.stage||'Leads', date:(c.date? new Date(c.date).toISOString() : new Date().toISOString()), action:'Created'}];
     if(!c.customFields || typeof c.customFields !== 'object') c.customFields = {};
@@ -835,11 +951,6 @@ async function loadData(){
   updateSyncBadge();
   renderAll();
 }
-async function persist(){
-  updateSyncBadge('saving');
-  await storageSet(STORE_KEY, JSON.stringify(customers));
-  updateSyncBadge();
-}
 async function persistConfig(){
   updateSyncBadge('saving');
   await storageSet(CONFIG_KEY, JSON.stringify({
@@ -848,8 +959,6 @@ async function persistConfig(){
   }));
   updateSyncBadge();
 }
-function save(){ persist(); renderAll(); }
-
 function updateSyncBadge(state){
   const el = document.getElementById('sync-badge');
   if(!el) return;
@@ -1150,7 +1259,7 @@ function assignOwner(id, uid){
   c.ownerName = next ? nameOfUid(next) : '';
   if(!Array.isArray(c.journey)) c.journey = [];
   c.journey.push({ stage: c.stage, date: new Date().toISOString(), action: 'Owner set to ' + ownerNameOf(c), ...stampBy() });
-  save();
+  saveUpdatedCustomer(c);
   if(activeRecordId === id) openRecord(id);
   showToast('Owner updated — ' + ownerNameOf(c));
 }
@@ -1358,7 +1467,7 @@ function updateStage(id, s){
     const claimed = ensureOwner(c); // progress always has an owner
     c.journey.push({stage:s, date:new Date().toISOString(), action: wasLead ? 'Lead converted' : 'Stage change', ...stampBy()});
     if(claimed) showToast('Assigned to you — ' + myName());
-    save(); 
+    saveUpdatedCustomer(c);
     if(activeRecordId === id) openRecord(id);
   } 
 }
@@ -1396,7 +1505,7 @@ function finalizeConvertLead(id){
     if(!Array.isArray(c.journey)) c.journey = [];
     ensureOwner(c);
     c.journey.push({stage:c.stage, date:new Date().toISOString(), action:'Lead converted', ...stampBy()});
-    save();
+    saveUpdatedCustomer(c);
     openRecord(id);
     showToast('Lead converted to Contact — Progress: ' + c.stage);
   }
@@ -1406,7 +1515,7 @@ function deleteCustomer(id){
   if(confirm('Delete this contact record?')){
     customers = customers.filter(x=>x.id!==id);
     closeRecord();
-    save();
+    saveDeletedCustomer(id);
     showToast('Contact deleted');
   }
 }
@@ -1641,7 +1750,7 @@ function saveContact(){
     }
     showToast('Changes saved');
     closeModal();
-    save();
+    if(index !== -1) saveUpdatedCustomer(customers[index]);
     if(activeRecordId) openRecord(activeRecordId);
   } else {
     payload.stage = 'Leads';
@@ -1649,12 +1758,13 @@ function saveContact(){
     payload.ownerId = newOwner;
     payload.ownerName = newOwner ? (nameOfUid(newOwner) || myName()) : '';
     const id = newId();
-    customers.unshift({
+    const newRecord = {
       id, ...payload,
       flags: Object.fromEntries(Object.keys(FLAG_LABELS).map(k => [k, false])),
       date: nowIso.split('T')[0],
       journey: [{stage: 'Leads', date: nowIso, action: 'Created', ...stampBy()}]
-    });
+    };
+    customers.unshift(newRecord);
     if(!AREA_SUGGESTIONS.includes(area) && area){
       AREA_SUGGESTIONS = [...AREA_SUGGESTIONS, area];
       persistConfig();
@@ -1662,7 +1772,7 @@ function saveContact(){
     }
     showToast('Lead saved');
     closeModal();
-    save();
+    saveNewCustomer(newRecord);
     openFrictionModal(id);
   }
 }
@@ -1694,7 +1804,7 @@ function saveFrictionPoint(){
   if(!Array.isArray(c.journey)) c.journey = [];
   c.journey.push({stage:c.stage, date:new Date().toISOString(), action:'Friction point logged', ...stampBy()});
   closeFrictionModal();
-  save();
+  saveUpdatedCustomer(c);
   showToast('Friction point saved');
   if(activeRecordId === c.id) openRecord(c.id);
 }
